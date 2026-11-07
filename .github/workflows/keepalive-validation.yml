@@ -1,0 +1,131 @@
+name: TCP keepalive test validation
+'on':
+  push:
+    branches: [ci/sagernet-keepalive-validation]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', '1.26.x']
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '4'
+      GOAMD64: v1
+      GOFLAGS: -mod=readonly
+      GOCACHE: ${{ github.workspace }}/.ci/go-cache
+      GOMODCACHE: ${{ github.workspace }}/.ci/mod-cache
+      GOTMPDIR: ${{ github.workspace }}/.ci/tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 34c0c18c1b5c7d2108a9f616345586260b6e6bca
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare bounded workspace
+        run: |
+          # Two independent ephemeral VM slots, each: 6 GiB caches,
+          # 512 MiB scratch and 16 MiB evidence. No shared writable cache.
+          mkdir -p .ci/tests .ci/tmp evidence
+          test "$(df -Pk . | awk 'NR==2{print $4}')" -gt 8388608
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Verify exact source and unchanged runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 34c0c18c1b5c7d2108a9f616345586260b6e6bca
+          test "$(cat /proc/sys/net/ipv4/tcp_invalid_ratelimit)" = 500
+          git diff --exit-code 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a -- '*.go' ':!*_test.go'
+          git rev-parse HEAD | tee evidence/identity.txt
+          go version | tee -a evidence/identity.txt
+          uname -a | tee -a evidence/identity.txt
+          printf 'tcp_invalid_ratelimit=' | tee -a evidence/identity.txt
+          cat /proc/sys/net/ipv4/tcp_invalid_ratelimit | tee -a evidence/identity.txt
+          python3 - <<'CODE'
+          from pathlib import Path
+          import subprocess
+          base=subprocess.check_output(['git','show','7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a:stack_go_integration_options_test.go'],text=True)
+          current=Path('stack_go_integration_options_test.go').read_text()
+          a=base.index('\tt.Run("vanished"');b=base.index('\tt.Run("answered"',a)
+          assert base[a:b]==current[a:b]
+          assert subprocess.check_output(['git','diff','--name-only','7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a'],text=True).splitlines()==['stack_go_integration_options_test.go']
+          CODE
+      - name: Reproduce unchanged baseline failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach .ci/base 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a
+          python3 - <<'CODE'
+          import subprocess,json
+          from pathlib import Path
+          r=subprocess.run(['go','test','-p','4','-json','-exec','sudo','-run','^TestGoConnKeepalive$','.'],cwd='.ci/base',stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=180)
+          Path('evidence/baseline-keepalive.jsonl').write_text(r.stdout)
+          events=[json.loads(s) for s in r.stdout.splitlines() if s.startswith('{')]
+          failed=sorted({e['Test'] for e in events if e.get('Action')=='fail' and 'Test' in e})
+          expected=sorted(['TestGoConnKeepalive','TestGoConnKeepalive/answered']+[f'TestGoConnKeepalive/answered/ipv6={v},dialed={d}' for v in ['false','true'] for d in ['false','true']])
+          assert r.returncode==1 and failed==expected,(r.returncode,failed,r.stdout)
+          assert 'kernel answered 1 of 3 probes' in r.stdout
+          print('BASELINE_FAILURE='+json.dumps({'status':r.returncode,'failed':failed}))
+          CODE
+      - name: Repeated healthy and vanished checks
+        run: |
+          set -euo pipefail
+          go test -p 4 -v -exec sudo -run '^TestGoConnKeepalive$' -count=5 . | tee evidence/repeated-keepalive.txt
+      - name: Complete upstream make test
+        run: |
+          set -euo pipefail
+          TEST_FLAGS='-exec sudo' make test | tee evidence/full-suite.txt
+      - name: Race keepalive checks
+        if: matrix.go == '1.26.x'
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -p 4 -race -v -exec sudo -run '^TestGoConnKeepalive$' . | tee evidence/race.txt
+      - name: Linux lint for changed code
+        if: matrix.go == '1.25.x'
+        uses: golangci/golangci-lint-action@v8
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          GOLANGCI_LINT_CACHE: ${{ github.workspace }}/.ci/lint-cache
+        with:
+          version: latest
+          args: --timeout=15m --new-from-rev=7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a
+          install-mode: binary
+          verify: false
+          skip-cache: true
+      - name: Optional gVisor and Darwin compile checks
+        if: matrix.go == '1.26.x'
+        run: |
+          set -euo pipefail
+          go test -p 4 -tags with_gvisor -run '^$' .
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -p 4 -c -o .ci/tests/darwin .
+      - name: Complete suite with the separate GRO patch
+        if: matrix.go == '1.26.x'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach .ci/combined HEAD
+          git diff 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a ca9f654a1d71ae1cffcb2dc87587262e9fd65bc5 -- tun_offload_linux.go tun_offload_single_linux_test.go > evidence/combined-gro.patch
+          sha256sum evidence/combined-gro.patch | tee evidence/combined-input.txt
+          printf 'base=34c0c18c1b5c7d2108a9f616345586260b6e6bca\ngro=ca9f654a1d71ae1cffcb2dc87587262e9fd65bc5\n' | tee -a evidence/combined-input.txt
+          git -C .ci/combined apply "$GITHUB_WORKSPACE/evidence/combined-gro.patch"
+          (cd .ci/combined; TEST_FLAGS='-exec sudo' make test) | tee evidence/combined-full-suite.txt
+      - name: Budget and cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d .ci ]; then du -sk .ci; test "$(du -sk .ci | cut -f1)" -lt 6815744; fi
+          if [ -d .ci/tmp ]; then test "$(du -sk .ci/tmp | cut -f1)" -lt 524288; fi
+          if [ -d evidence ]; then du -sk evidence; test "$(du -sk evidence | cut -f1)" -lt 16384; fi
+          if [ -d .ci/base ]; then git worktree remove --force .ci/base; fi
+          if [ -d .ci/combined ]; then git worktree remove --force .ci/combined; fi
+          if [ -d .ci/mod-cache ]; then go clean -modcache; fi
+          rm -rf .ci/go-cache .ci/tests .ci/tmp .ci/lint-cache
