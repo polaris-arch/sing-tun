@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ffd09fa333d96d08f0520237d845f4d90bac811d
+          ref: ca9f654a1d71ae1cffcb2dc87587262e9fd65bc5
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare bounded workspace
@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = ffd09fa333d96d08f0520237d845f4d90bac811d
+          test "$(git rev-parse HEAD)" = ca9f654a1d71ae1cffcb2dc87587262e9fd65bc5
           go version | tee evidence/identity.txt
           git rev-parse HEAD | tee -a evidence/identity.txt
           python3 - <<'CODE'
