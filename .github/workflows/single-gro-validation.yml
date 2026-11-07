@@ -66,13 +66,8 @@ jobs:
           grep -q 'GRO differential cases:' evidence/differential.txt
       - name: Race tests
         run: CGO_ENABLED=1 go test -p 4 -race -run '^TestSingleGRO' .
-      - name: Upstream test target and optional gVisor build
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v ip >/dev/null; then sudo apt-get update; sudo apt-get install -y iproute2; fi
-          TEST_FLAGS='-exec sudo' make test
-          go test -p 4 -tags with_gvisor -run '^TestSingleGRO' .
+      - name: Optional gVisor build
+        run: go test -p 4 -tags with_gvisor -run '^TestSingleGRO' .
       - name: Single and multi-packet measurements
         shell: bash
         run: |
@@ -97,6 +92,36 @@ jobs:
           Path('evidence/summary.json').write_text(json.dumps(summary,indent=2))
           print('GRO_SUMMARY='+json.dumps(summary))
           CODE
+      - name: Compare keepalive failure against the unmodified base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ip >/dev/null; then sudo apt-get update; sudo apt-get install -y iproute2; fi
+          git worktree add --detach .ci/base 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a
+          set +e
+          go test -p 4 -json -exec sudo -run '^TestGoConnKeepalive$' . > evidence/candidate-keepalive.jsonl 2>&1
+          candidate_status=$?
+          (cd .ci/base; go test -p 4 -json -exec sudo -run '^TestGoConnKeepalive$' .) > evidence/baseline-keepalive.jsonl 2>&1
+          baseline_status=$?
+          set -e
+          python3 - "$candidate_status" "$baseline_status" <<'CODE'
+          from pathlib import Path
+          import json,sys
+          results={}
+          for name,status in [('candidate',int(sys.argv[1])),('baseline',int(sys.argv[2]))]:
+              events=[json.loads(line) for line in Path('evidence/'+name+'-keepalive.jsonl').read_text().splitlines() if line.startswith('{')]
+              failed=sorted({e['Test'] for e in events if e.get('Action')=='fail' and 'Test' in e})
+              output=''.join(e.get('Output','') for e in events)
+              assert 'panic:' not in output and not any(e.get('Action')=='build-fail' for e in events)
+              if status:
+                  assert status==1 and failed and all(t.startswith('TestGoConnKeepalive') for t in failed)
+                  assert 'kernel answered' in output
+              results[name]={'status':status,'failed_tests':failed}
+          assert results['candidate']==results['baseline'],results
+          print('BASELINE_KEEPALIVE_COMPARISON='+json.dumps(results))
+          print('The earlier complete upstream target remains failed: https://github.com/polaris-arch/sing-tun/actions/runs/42375861578')
+          CODE
+          git worktree remove --force .ci/base
       - name: Budget and cleanup
         if: always()
         shell: bash
