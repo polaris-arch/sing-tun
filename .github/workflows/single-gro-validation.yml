@@ -66,6 +66,19 @@ jobs:
           grep -q 'GRO differential cases:' evidence/differential.txt
       - name: Race tests
         run: CGO_ENABLED=1 go test -p 4 -race -run '^TestSingleGRO' .
+      - name: Linux lint for changed code
+        if: matrix.go == '1.25.x'
+        uses: golangci/golangci-lint-action@v8
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          GOLANGCI_LINT_CACHE: ${{ github.workspace }}/.ci/lint-cache
+        with:
+          version: latest
+          args: --timeout=15m --new-from-rev=7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a
+          install-mode: binary
+          verify: false
+          skip-cache: true
       - name: Optional gVisor build
         run: go test -p 4 -tags with_gvisor -run '^TestSingleGRO' .
       - name: Single and multi-packet measurements
@@ -130,4 +143,4 @@ jobs:
           if [ -d .ci ]; then du -sk .ci; test "$(du -sk .ci | cut -f1)" -lt 6815744; fi
           if [ -d evidence ]; then du -sk evidence; test "$(du -sk evidence | cut -f1)" -lt 16384; fi
           if [ -d .ci/mod-cache ]; then go clean -modcache; fi
-          rm -rf .ci/go-cache .ci/tests .ci/tmp
+          rm -rf .ci/go-cache .ci/tests .ci/tmp .ci/lint-cache
