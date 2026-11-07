@@ -59,7 +59,8 @@ jobs:
           set -euo pipefail
           exec 9>.ci/occupancy.lock; flock -n 9
           go build -p 4 .
-          go test -p 4 -v -timeout 8m . ./ping 2>&1 | tee evidence/full.txt
+          go test -p 4 -v -timeout 8m . 2>&1 | tee evidence/full.txt
+          go test -p 4 -v -timeout 2m -exec sudo ./ping 2>&1 | tee evidence/ping.txt
           go test -p 4 -tags with_gvisor -timeout 5m -run '^TestNativeWritePath|^TestMips' . 2>&1 | tee evidence/gvisor.txt
       - name: Race and actual GSO TUN delivery
         shell: bash
