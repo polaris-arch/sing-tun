@@ -1,0 +1,37 @@
+name: GRO single-packet validation
+on:
+  push:
+    branches: [ci/pr3381]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.20.14', '1.26.10']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1f00cc6e33bf0d66610561b8b916d7d134c8e492
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Source identity and formatting
+        run: |
+          test "$(git rev-parse HEAD)" = 1f00cc6e33bf0d66610561b8b916d7d134c8e492
+          test -z "$(gofmt -l tun_offload_single_linux_test.go)"
+      - name: Differential regression
+        run: go test -count=1 -run '^TestSingleGROEquivalence$' -v .
+      - name: Differential race regression
+        run: go test -race -count=1 -run '^TestSingleGROEquivalence$' -v .
+      - name: Linux builds
+        run: |
+          go build .
+          go build -tags with_gvisor .
+      - name: Benchmark smoke
+        if: matrix.go == '1.26.10'
+        run: go test -run '^$' -bench '^BenchmarkGRO(Native)?Paths$' -benchtime=100ms -count=1 -benchmem .
