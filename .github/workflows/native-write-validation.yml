@@ -1,0 +1,96 @@
+name: Native TUN single-write validation
+on:
+  push:
+    branches: [ci/native-tun-single-write]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '4'
+      GOAMD64: v1
+      GOFLAGS: -mod=readonly
+      GOCACHE: ${{ github.workspace }}/.ci/go-cache
+      GOMODCACHE: ${{ github.workspace }}/.ci/mod-cache
+      GOTMPDIR: ${{ github.workspace }}/.ci/tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: aa35f84df66e5e79065121287d4620212adbf89a
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Source identity and frozen control
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/tests .ci/tmp evidence
+          exec 9>.ci/occupancy.lock; flock -n 9
+          test "$(df -Pk . | awk 'NR==2{print $4}')" -gt 8388608
+          test "$(git rev-parse HEAD)" = aa35f84df66e5e79065121287d4620212adbf89a
+          git rev-parse HEAD | tee evidence/identity.txt
+          go version | tee -a evidence/identity.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,subprocess
+          def function(text,start):
+              i=text.index(start);j=text.index('{',i);depth=1;k=j+1
+              while depth:
+                  depth+=(text[k]=='{')-(text[k]=='}');k+=1
+              return text[i:k]
+          original=subprocess.check_output(['git','show','8daae1bf185888b549f216934df3efddbfd66399:tun_linux.go'],text=True)
+          frozen=function(Path('tun_write_path_linux_test.go').read_text(),'func controlNativeBatchWrite(').replace('func controlNativeBatchWrite(t *NativeTun, ','func (t *NativeTun) BatchWrite(',1)
+          assert frozen==function(original,'func (t *NativeTun) BatchWrite(')
+          actual=function(Path('tun_linux.go').read_text(),'func (t *NativeTun) batchWrite(').replace(') batchWrite(',') BatchWrite(',1)
+          assert actual==frozen
+          Path('evidence/source.json').write_text(json.dumps({'control_sha256':hashlib.sha256(frozen.encode()).hexdigest(),'multi_packet_body_unchanged':True,'files':{f:hashlib.sha256(Path(f).read_bytes()).hexdigest() for f in ['tun_linux.go','tun_write_path_linux_test.go','stack_mipstack_io_test.go']}},indent=2))
+          PY
+      - name: Full current-platform tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec 9>.ci/occupancy.lock; flock -n 9
+          go build -p 4 .
+          go test -p 4 -v -timeout 8m . ./ping 2>&1 | tee evidence/full.txt
+          go test -p 4 -tags with_gvisor -timeout 5m -run '^TestNativeWritePath|^TestMips' . 2>&1 | tee evidence/gvisor.txt
+      - name: Race and actual GSO TUN delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec 9>.ci/occupancy.lock; flock -n 9
+          CGO_ENABLED=1 go test -p 4 -race -timeout 5m -run '^TestNativeWritePath|^TestMipsLinux' . 2>&1 | tee evidence/race.txt
+          go test -p 4 -c -o .ci/tests/native-tests .
+          sudo unshare --net -- sh -c 'ip link set lo up; exec env TUN_WRITE_KERNEL=1 "$1" -test.v -test.run="^TestNativeWritePathKernel$" -test.timeout=60s' sh "$PWD/.ci/tests/native-tests" 2>&1 | tee evidence/kernel.txt
+      - name: Cross-platform builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec 9>.ci/occupancy.lock; flock -n 9
+          for platform in linux/arm64 windows/amd64 darwin/arm64; do
+            GOOS=${platform%/*} GOARCH=${platform#*/} CGO_ENABLED=0 go build -p 4 -tags with_gvisor .
+          done
+      - name: Budget and retire temporary caches
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d .ci ]; then
+            exec 9>.ci/occupancy.lock; flock -n 9
+            du -sk .ci evidence | tee evidence/disk-kib.txt
+            test "$(du -sk .ci | cut -f1)" -lt 6815744
+            test "$(du -sk evidence | cut -f1)" -lt 16384
+            if [ -d .ci/mod-cache ]; then go clean -modcache; fi
+            python3 -c 'import pathlib,shutil; root=pathlib.Path(".ci").resolve(); [(shutil.rmtree(root/name) if (root/name).is_dir() and not (root/name).is_symlink() else None) for name in ["go-cache","tests","tmp"]]'
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-write-validation
+          path: evidence/
+          retention-days: 7
