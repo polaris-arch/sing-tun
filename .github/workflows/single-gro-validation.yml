@@ -1,0 +1,108 @@
+name: Single-packet GRO validation
+'on':
+  push:
+    branches: [ci/sagernet-single-gro]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', '1.26.x']
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '4'
+      GOAMD64: v1
+      GOFLAGS: -mod=readonly
+      GOCACHE: ${{ github.workspace }}/.ci/go-cache
+      GOMODCACHE: ${{ github.workspace }}/.ci/mod-cache
+      GOTMPDIR: ${{ github.workspace }}/.ci/tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ffd09fa333d96d08f0520237d845f4d90bac811d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare bounded workspace
+        run: |
+          mkdir -p .ci/tests .ci/tmp evidence
+          test "$(df -Pk . | awk 'NR==2{print $4}')" -gt 8388608
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Verify source and frozen reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ffd09fa333d96d08f0520237d845f4d90bac811d
+          go version | tee evidence/identity.txt
+          git rev-parse HEAD | tee -a evidence/identity.txt
+          python3 - <<'CODE'
+          from pathlib import Path
+          import subprocess,hashlib
+          def function(source,name):
+              a=source.index('func '+name+'(');i=source.index('{',a);depth=1;j=i+1
+              while depth:
+                  if source[j]=='{':depth+=1
+                  elif source[j]=='}':depth-=1
+                  j+=1
+              return source[a:j]
+          base=subprocess.check_output(['git','show','7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a:tun_offload_linux.go'],text=True)
+          original=function(base,'handleGRO')
+          reference=function(Path('tun_offload_single_linux_test.go').read_text(),'controlHandleGRO').replace('func controlHandleGRO(','func handleGRO(',1)
+          assert original==reference
+          print('frozen_reference_sha256='+hashlib.sha256(original.encode()).hexdigest())
+          CODE
+      - name: Differential tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -p 4 -v -run '^TestSingleGRO' . | tee evidence/differential.txt
+          grep -q 'GRO differential cases:' evidence/differential.txt
+      - name: Race tests
+        run: CGO_ENABLED=1 go test -p 4 -race -run '^TestSingleGRO' .
+      - name: Upstream test target and optional gVisor build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ip >/dev/null; then sudo apt-get update; sudo apt-get install -y iproute2; fi
+          TEST_FLAGS='-exec sudo' make test
+          go test -p 4 -tags with_gvisor -run '^TestSingleGRO' .
+      - name: Single and multi-packet measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -p 4 -c -o .ci/tests/gro .
+          for round in 1 2 3 4 5; do
+            .ci/tests/gro -test.run='^$' -test.bench='^BenchmarkGROPaths$' -test.benchmem -test.benchtime=300ms | tee -a evidence/bench.txt
+          done
+          python3 - <<'CODE'
+          from pathlib import Path
+          import json,re,statistics
+          rows={}
+          for line in Path('evidence/bench.txt').read_text().splitlines():
+              if not line.startswith('BenchmarkGROPaths/'):continue
+              name=line.split()[0].rsplit('-',1)[0]
+              rows.setdefault(name,[]).append([float(re.search(r'([0-9.]+) ns/op',line)[1]),int(re.search(r'(\d+) B/op',line)[1]),int(re.search(r'(\d+) allocs/op',line)[1])])
+          assert len(rows)==12 and all(len(v)==5 for v in rows.values())
+          summary={name:{'ns_per_op_median':statistics.median(v[0] for v in values),'bytes_per_op_median':statistics.median(v[1] for v in values),'allocs_per_op_median':statistics.median(v[2] for v in values),'samples':values} for name,values in rows.items()}
+          for udp in ['false','true']:
+              old=summary['BenchmarkGROPaths/n1_udp'+udp+'_candidatefalse'];new=summary['BenchmarkGROPaths/n1_udp'+udp+'_candidatetrue']
+              assert new['ns_per_op_median']<old['ns_per_op_median'] and new['allocs_per_op_median']<=old['allocs_per_op_median']
+          Path('evidence/summary.json').write_text(json.dumps(summary,indent=2))
+          print('GRO_SUMMARY='+json.dumps(summary))
+          CODE
+      - name: Budget and cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d .ci ]; then du -sk .ci; test "$(du -sk .ci | cut -f1)" -lt 6815744; fi
+          if [ -d evidence ]; then du -sk evidence; test "$(du -sk evidence | cut -f1)" -lt 16384; fi
+          if [ -d .ci/mod-cache ]; then go clean -modcache; fi
+          rm -rf .ci/go-cache .ci/tests .ci/tmp
