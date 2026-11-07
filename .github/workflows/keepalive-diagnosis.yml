@@ -1,0 +1,85 @@
+name: TCP keepalive diagnosis
+'on':
+  push:
+    branches: [diag/tcp-keepalive]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '4'
+      GOAMD64: v1
+      GOFLAGS: -mod=readonly
+      GOCACHE: ${{ github.workspace }}/.ci/go-cache
+      GOMODCACHE: ${{ github.workspace }}/.ci/mod-cache
+      GOTMPDIR: ${{ github.workspace }}/.ci/tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare bounded workspace
+        run: |
+          mkdir -p .ci/tests .ci/tmp evidence
+          test "$(df -Pk . | awk 'NR==2{print $4}')" -gt 8388608
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Verify production source and compile diagnostic tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a -- '*.go' ':!*_test.go'
+          git diff --exit-code 7ac0256fa09ddf7215f3a7ccd0845ed18b235c4a -- stack_go_integration_options_test.go
+          git rev-parse HEAD | tee evidence/identity.txt
+          go version | tee -a evidence/identity.txt
+          uname -a | tee -a evidence/identity.txt
+          go test -p 4 -c -o .ci/tests/tun .
+      - name: Controlled network namespace experiments
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ip
+          command -v unshare
+          cat > .ci/run-netns.sh <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          ip link set lo up
+          sysctl -q -w "net.ipv4.tcp_invalid_ratelimit=$1"
+          export KA_IDLE_MS="$2"
+          printf 'NETNS=%s INVALID_RATE=%s IDLE=%s\n' "$(readlink /proc/self/ns/net)" "$(cat /proc/sys/net/ipv4/tcp_invalid_ratelimit)" "$KA_IDLE_MS"
+          exec .ci/tests/tun -test.v -test.run="$3" -test.count="$4" -test.timeout=4m
+          SH
+          python3 - <<'CODE'
+          import subprocess,json
+          from pathlib import Path
+          host_before=Path('/proc/sys/net/ipv4/tcp_invalid_ratelimit').read_text()
+          results=[]
+          for rate,idle,pattern,count in [(500,100,'^TestGoConnKeepalive$',1),(0,100,'^TestGoConnKeepalive$',1),(500,100,'^TestKeepaliveDiagnosis$',2),(0,100,'^TestKeepaliveDiagnosis$',2),(500,1000,'^TestKeepaliveDiagnosis$',2)]:
+              name=f'rate{rate}-idle{idle}-'+('original' if 'GoConn' in pattern else 'trace')
+              r=subprocess.run(['sudo','unshare','--net','bash','.ci/run-netns.sh',str(rate),str(idle),pattern,str(count)],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=240)
+              Path('evidence/'+name+'.txt').write_text(r.stdout)
+              rows=[json.loads(line.split('KA_DIAG_JSON=',1)[1]) for line in r.stdout.splitlines() if 'KA_DIAG_JSON=' in line]
+              results.append({'name':name,'status':r.returncode,'rows':rows})
+              print('EXPERIMENT='+json.dumps({'name':name,'status':r.returncode}),flush=True)
+              print(r.stdout,flush=True)
+              if 'Diagnosis' in pattern:
+                  assert r.returncode==0 and len(rows)==8,name
+              else:
+                  assert r.returncode in [0,1] and 'TestGoConnKeepalive' in r.stdout,name
+          assert Path('/proc/sys/net/ipv4/tcp_invalid_ratelimit').read_text()==host_before
+          Path('evidence/results.json').write_text(json.dumps(results,indent=2))
+          print('KA_EXPERIMENT_RESULTS='+json.dumps(results))
+          CODE
+      - name: Budget and cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d .ci ]; then du -sk .ci; test "$(du -sk .ci | cut -f1)" -lt 6815744; fi
+          if [ -d evidence ]; then du -sk evidence; test "$(du -sk evidence | cut -f1)" -lt 16384; fi
+          if [ -d .ci/mod-cache ]; then go clean -modcache; fi
+          rm -rf .ci/go-cache .ci/tests .ci/tmp
